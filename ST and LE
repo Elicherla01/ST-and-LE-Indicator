@@ -1,0 +1,286 @@
+//@version=6
+//Author: Ravindra Elicherla https://x.com/Ravindra_PE
+indicator('ST Entry and Lazy Exit v6 - Modified', shorttitle='ST and Lazy Exit', overlay=true)
+
+// ===== INPUT PARAMETERS =====
+const string calcGroup = 'Calculation'
+// Supertrend parameters for buy signals
+st_length = input.int(10, title='Supertrend ATR Period', minval=1, group=calcGroup, tooltip='Period for Supertrend ATR calculation')
+st_mult = input.float(3.0, step=0.1, title='Supertrend Multiplier', minval=0.1, group=calcGroup, tooltip='Multiplier for Supertrend ATR')
+
+// Lazy Exit parameters for sell signals
+le_length = input.int(22, title='Lazy Exit ATR Period', minval=1, group=calcGroup, tooltip='Period for Lazy Exit ATR calculation')
+le_mult = input.float(4.0, step=0.1, title='Lazy Exit Multiplier', minval=0.1, group=calcGroup, tooltip='Multiplier for Lazy Exit ATR (typically higher than Chandelier)')
+le_sensitivity = input.float(1.5, step=0.1, title='Lazy Update Threshold', minval=0.1, group=calcGroup, tooltip='Minimum price movement (in ATR) required to update stop')
+le_bars_delay = input.int(2, title='Lazy Update Delay (bars)', minval=0, group=calcGroup, tooltip='Number of bars to wait before updating stop')
+
+const string visualGroup = 'Visuals'
+showLabels = input.bool(true, title='Show Buy/Sell Labels', group=visualGroup, tooltip='Display entry and exit signal labels')
+highlightState = input.bool(true, title='Highlight State', group=visualGroup, tooltip='Fill background color based on trend direction')
+showTable = input.bool(true, title='Show Performance Table', group=visualGroup, tooltip='Display real-time performance metrics')
+tablePosition = input.string('Top Right', title='Table Position', options=['Top Left', 'Top Right', 'Bottom Left', 'Bottom Right'], group=visualGroup, tooltip='Choose where to display the performance table')
+
+const string alertGroup = 'Alerts'
+awaitBarConfirmation = input.bool(true, title='Await Bar Confirmation', group=alertGroup, tooltip='Wait for bar close before triggering alerts')
+
+string colorGroup = 'Colors'
+longColor = input.color(color.green, title='Long Color', group=colorGroup)
+shortColor = input.color(color.red, title='Short Color', group=colorGroup)
+textColor = input.color(color.white, title='Label Text Color', group=colorGroup)
+
+// ===== SUPERTREND CALCULATIONS (for BUY signals) =====
+st_atr = ta.atr(st_length)
+st_hl2 = hl2
+st_upperband = st_hl2 + (st_mult * st_atr)
+st_lowerband = st_hl2 - (st_mult * st_atr)
+
+var float st_ub = na
+var float st_lb = na
+st_ub := st_upperband < nz(st_ub[1]) or close[1] > nz(st_ub[1]) ? st_upperband : nz(st_ub[1])
+st_lb := st_lowerband > nz(st_lb[1]) or close[1] < nz(st_lb[1]) ? st_lowerband : nz(st_lb[1])
+
+var int st_direction = 1
+st_direction := close > st_ub[1] ? 1 : close < st_lb[1] ? -1 : st_direction
+
+st_supertrend = st_direction == -1 ? st_ub : st_lb
+
+// ===== LAZY EXIT CALCULATIONS (for SELL signals) =====
+le_atr_raw = ta.atr(le_length)
+le_atr = le_mult * le_atr_raw
+
+// Lazy Exit variables
+var float lazyStop = na
+var float entryPrice = na
+var int barsInPosition = 0
+var int lastUpdateBar = 0
+
+// Calculate potential new stop level
+potentialStop = ta.highest(high, le_length) - le_atr
+
+// Update bars in position counter when we have an entry price
+if not na(entryPrice)
+    barsInPosition += 1
+
+// Lazy Exit Logic: Only update stop if conditions are met
+shouldUpdateStop = false
+if not na(lazyStop) and not na(entryPrice)
+    // Calculate price appreciation since entry
+    priceGain = close - entryPrice
+    priceGainInATR = priceGain / le_atr_raw
+    
+    // Calculate how much higher the potential stop is
+    stopImprovement = potentialStop - lazyStop
+    stopImprovementInATR = stopImprovement / le_atr_raw
+    
+    // Update conditions:
+    // 1. Price has gained at least the sensitivity threshold
+    // 2. New stop level is significantly higher than current
+    // 3. Minimum bars delay has passed since last update
+    shouldUpdateStop := priceGainInATR >= le_sensitivity and stopImprovementInATR >= (le_sensitivity * 0.5) and (bar_index - lastUpdateBar) >= le_bars_delay and potentialStop > lazyStop
+
+// Update the lazy stop
+if shouldUpdateStop
+    lazyStop := potentialStop
+    lastUpdateBar := bar_index
+
+// Use the current lazy stop or fallback to basic calculation
+longStop = na(lazyStop) ? potentialStop : lazyStop
+
+// ===== POSITION MANAGEMENT =====
+// Track position state: 0 = no position (waiting), 1 = long position
+var int position_dir = 0
+var bool inPosition = false
+
+// ===== SIGNAL TRACKING VARIABLES =====
+var string lastSignalTypeStr = "None"
+var int lastSignalTime = 0
+
+// ===== SIGNAL GENERATION =====
+// Raw signals from indicators
+st_buy_condition = st_direction == 1 and st_direction[1] == -1
+le_sell_condition = not na(longStop) and close < longStop and close[1] >= longStop[1]
+
+// Buy Signal: Only when not in position
+buySignal = st_buy_condition and not inPosition
+
+// Sell Signal: Only when in position (ensures only one sell after buy)
+sellSignal = le_sell_condition and inPosition
+
+// Update position state and track last signal
+if buySignal
+    position_dir := 1
+    inPosition := true
+    // Set entry price and initialize lazy stop
+    entryPrice := close
+    lazyStop := close - le_atr
+    barsInPosition := 0
+    lastUpdateBar := bar_index
+    // Track signal info
+    lastSignalTypeStr := "BUY"
+    lastSignalTime := time
+else if sellSignal
+    position_dir := 0
+    inPosition := false
+    // Reset entry tracking
+    entryPrice := na
+    lazyStop := na
+    barsInPosition := 0
+    // Track signal info
+    lastSignalTypeStr := "SELL"
+    lastSignalTime := time
+
+// Apply bar confirmation if enabled
+confirmedBuySignal = awaitBarConfirmation ? (buySignal and barstate.isconfirmed) : buySignal
+confirmedSellSignal = awaitBarConfirmation ? (sellSignal and barstate.isconfirmed) : sellSignal
+
+// ===== VISUAL ELEMENTS =====
+// Define colors with transparency
+longFillColor = color.new(longColor, 85)
+shortFillColor = color.new(shortColor, 85)
+waitingColor = color.new(color.gray, 90)
+
+// Plot Supertrend
+plot(st_supertrend, title='Supertrend', style=plot.style_line, linewidth=2, color=st_direction == 1 ? longColor : shortColor)
+
+// Plot Lazy Exit Stop (different color to distinguish from Chandelier)
+plot(longStop, title='Lazy Exit Stop', style=plot.style_line, linewidth=2, color=color.orange)
+
+// Plot entry/exit markers
+plotshape(buySignal ? low : na, title='Buy Signal Marker', location=location.belowbar, style=shape.circle, size=size.small, color=longColor)
+plotshape(sellSignal ? high : na, title='Sell Signal Marker', location=location.abovebar, style=shape.circle, size=size.small, color=shortColor)
+
+// Plot entry/exit labels
+plotshape(showLabels and buySignal ? low : na, title='Buy Label', text='BUY\n(ST)', location=location.belowbar, style=shape.labelup, size=size.normal, color=longColor, textcolor=textColor)
+plotshape(showLabels and sellSignal ? high : na, title='Sell Label', text='SELL\n(LE)', location=location.abovebar, style=shape.labeldown, size=size.normal, color=shortColor, textcolor=textColor)
+
+// Background highlighting based on position
+bgcolor(highlightState and inPosition ? longFillColor : highlightState and not inPosition ? waitingColor : na, title='Position Background')
+
+// ===== CUMULATIVE SIGNAL COUNTS =====
+var int totalBuySignals = 0
+var int totalSellSignals = 0
+var int consecutiveBuys = 0
+var int consecutiveSells = 0
+var int barsSinceLastSignal = 0
+
+// Update signal counts
+if buySignal
+    totalBuySignals += 1
+    consecutiveBuys += 1
+    consecutiveSells := 0
+    barsSinceLastSignal := 0
+else if sellSignal
+    totalSellSignals += 1
+    consecutiveSells += 1
+    consecutiveBuys := 0
+    barsSinceLastSignal := 0
+else
+    barsSinceLastSignal += 1
+
+// Calculate distances
+distanceToST = inPosition ? math.abs(close - st_supertrend) : 0
+distanceToLE = inPosition ? math.abs(close - longStop) : 0
+
+// ===== PERFORMANCE TABLE =====
+if showTable and barstate.islast
+    // Determine table position based on user selection
+    tablePos = switch tablePosition
+        'Top Left' => position.top_left
+        'Top Right' => position.top_right
+        'Bottom Left' => position.bottom_left
+        'Bottom Right' => position.bottom_right
+        => position.top_right  // default fallback
+    
+    // Create table with 15 rows to accommodate new lazy exit metrics
+    var table perfTable = table.new(tablePos, 2, 15, bgcolor=color.white, border_width=1, frame_width=1, frame_color=color.gray)
+    
+    // Table header
+    table.cell(perfTable, 0, 0, "📊 ST Entry + Lazy Exit", text_color=color.white, bgcolor=color.gray, text_size=size.normal)
+    table.cell(perfTable, 1, 0, "Metrics", text_color=color.white, bgcolor=color.gray, text_size=size.normal)
+    
+    // Position status
+    table.cell(perfTable, 0, 1, "Status", text_color=color.black, text_size=size.small)
+    statusText = inPosition ? "IN POSITION (LONG)" : "⏳ WAITING FOR SIGNAL"
+    statusColor = inPosition ? color.green : color.orange
+    table.cell(perfTable, 1, 1, statusText, text_color=statusColor, text_size=size.small)
+    
+    // Supertrend status
+    table.cell(perfTable, 0, 2, "Supertrend", text_color=color.black, text_size=size.small)
+    table.cell(perfTable, 1, 2, st_direction == 1 ? "Bullish ↑" : "Bearish ↓", text_color=st_direction == 1 ? color.green : color.red, text_size=size.small)
+    
+    // Current Supertrend value
+    table.cell(perfTable, 0, 3, "ST Level", text_color=color.black, text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(st_supertrend, "#.##"), text_color=st_direction == 1 ? longColor : shortColor, text_size=size.small)
+    
+    // Lazy Exit level
+    table.cell(perfTable, 0, 4, "Lazy Stop", text_color=color.black, text_size=size.small)
+    table.cell(perfTable, 1, 4, str.tostring(longStop, "#.##"), text_color=color.orange, text_size=size.small)
+    
+    // Entry price (new for lazy exit)
+    table.cell(perfTable, 0, 5, "Entry Price", text_color=color.black, text_size=size.small)
+    entryText = not na(entryPrice) ? str.tostring(entryPrice, "#.##") : "N/A"
+    table.cell(perfTable, 1, 5, entryText, text_color=color.blue, text_size=size.small)
+    
+    // Bars in position (new for lazy exit)
+    table.cell(perfTable, 0, 6, "Bars in Position", text_color=color.black, text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(barsInPosition), text_color=color.blue, text_size=size.small)
+    
+    // Signal counts
+    table.cell(perfTable, 0, 7, "Total Buy Signals", text_color=color.black, text_size=size.small)
+    table.cell(perfTable, 1, 7, str.tostring(totalBuySignals), text_color=color.green, text_size=size.small)
+    
+    table.cell(perfTable, 0, 8, "Total Sell Signals", text_color=color.black, text_size=size.small)
+    table.cell(perfTable, 1, 8, str.tostring(totalSellSignals), text_color=color.red, text_size=size.small)
+    
+    // Bars since last signal
+    table.cell(perfTable, 0, 9, "Bars Since Signal", text_color=color.black, text_size=size.small)
+    table.cell(perfTable, 1, 9, str.tostring(barsSinceLastSignal), text_color=color.blue, text_size=size.small)
+    
+    // Last signal type
+    table.cell(perfTable, 0, 10, "Last Signal", text_color=color.black, text_size=size.small)
+    signalColor = lastSignalTypeStr == "BUY" ? color.green : lastSignalTypeStr == "SELL" ? color.red : color.gray
+    table.cell(perfTable, 1, 10, lastSignalTypeStr, text_color=signalColor, text_size=size.small)
+    
+    // Last signal date and time
+    table.cell(perfTable, 0, 11, "Signal Date/Time", text_color=color.black, text_size=size.small)
+    dateTimeText = lastSignalTime > 0 ? str.format("{0,date,MM/dd/yyyy HH:mm}", lastSignalTime) : "No signals yet"
+    table.cell(perfTable, 1, 11, dateTimeText, text_color=color.blue, text_size=size.small)
+    
+    // Distances
+    table.cell(perfTable, 0, 12, "Distance to ST", text_color=color.black, text_size=size.small)
+    distSTText = inPosition ? str.tostring(distanceToST, "#.##") : "N/A"
+    table.cell(perfTable, 1, 12, distSTText, text_color=color.blue, text_size=size.small)
+    
+    table.cell(perfTable, 0, 13, "Distance to LE", text_color=color.black, text_size=size.small)
+    distLEText = inPosition ? str.tostring(distanceToLE, "#.##") : "N/A"
+    table.cell(perfTable, 1, 13, distLEText, text_color=color.orange, text_size=size.small)
+    
+    // ATR values
+    table.cell(perfTable, 0, 14, "ST ATR | LE ATR", text_color=color.black, text_size=size.small)
+    table.cell(perfTable, 1, 14, str.tostring(st_atr, "#.##") + " | " + str.tostring(le_atr_raw, "#.##"), text_color=color.gray, text_size=size.small)
+
+// ===== ALERTS =====
+alertcondition(confirmedBuySignal, title='🟢 Supertrend Buy Signal', 
+               message='Supertrend BUY signal for {{ticker}} at {{close}} - {{time}}')
+
+alertcondition(confirmedSellSignal, title='🔴 Lazy Exit Sell Signal', 
+               message='Lazy Exit SELL signal for {{ticker}} at {{close}} - {{time}}')
+
+alertcondition((confirmedBuySignal or confirmedSellSignal), title='📈 Entry/Exit Signal', 
+               message='Trading signal triggered for {{ticker}} at {{close}} - {{time}}')
+
+// ===== ENHANCED LOGGING =====
+if barstate.isconfirmed and (buySignal or sellSignal)
+    signal_type = buySignal ? "BUY (Supertrend)" : "SELL (Lazy Exit)"
+    signal_level = buySignal ? st_supertrend : longStop
+    log.info("Signal: " + signal_type + " at " + str.tostring(close) + ", Level: " + str.tostring(signal_level))
+
+// Strategy performance note with status
+if barstate.islast
+    noteText = inPosition ? "📈 IN POSITION\n(LONG)" : "NO POSITION"
+    noteColor = inPosition ? color.green : color.gray
+    // Calculate label position with more distance from price
+    labelDistance = ta.atr(14) * 3  // Use 3x ATR for dynamic spacing
+    labelPrice = high + labelDistance
+    label.new(bar_index, labelPrice, noteText, 
+              style=label.style_label_down, color=noteColor, textcolor=color.white, size=size.small, xloc=xloc.bar_index)
